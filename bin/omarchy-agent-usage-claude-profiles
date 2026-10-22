@@ -52,8 +52,10 @@ def load_collector() -> ModuleType:
 def install_profile_scan(collector: ModuleType) -> None:
   cached_scan = collector.cached_scan
 
-  def cached_profiles_scan(projects_path: Path, max_age_seconds: float):
-    return cached_scan(project_roots(projects_path), max_age_seconds)
+  # Keep this signature open: upstream grew use_index in 4.5 and may grow more
+  # options. The wrapper must pass whatever main() sends straight through.
+  def cached_profiles_scan(projects_path: Path, *args, **kwargs):
+    return cached_scan(project_roots(projects_path), *args, **kwargs)
 
   collector.cached_scan = cached_profiles_scan
 
