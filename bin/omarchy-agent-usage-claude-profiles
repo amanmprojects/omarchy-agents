@@ -1,0 +1,69 @@
+#!/usr/bin/python3 -I
+"""Add ~/.claude-profiles/*/projects to Omarchy's installed Claude collector."""
+
+from __future__ import annotations
+
+import importlib.machinery
+import importlib.util
+import json
+import os
+from pathlib import Path
+from types import ModuleType
+
+
+class ProjectRoots:
+  # The upstream scanner only needs is_dir/rglob; its cache hashes str(root).
+  # Passing one view keeps its message/session deduplication shared across roots.
+  def __init__(self, roots: list[Path]):
+    self.roots = roots
+
+  def is_dir(self) -> bool:
+    return bool(self.roots)
+
+  def rglob(self, pattern: str):
+    for root in self.roots:
+      yield from root.rglob(pattern)
+
+  def __str__(self) -> str:
+    return "claude-profiles-v1:" + json.dumps([str(root) for root in self.roots])
+
+
+def project_roots(primary_projects: Path) -> ProjectRoots:
+  candidates = [primary_projects, Path.home() / ".claude" / "projects"]
+  profiles = Path.home() / ".claude-profiles"
+  if profiles.is_dir():
+    candidates.extend(profile / "projects" for profile in sorted(profiles.iterdir()) if profile.is_dir())
+  roots = list(dict.fromkeys(path.resolve() for path in candidates if path.is_dir()))
+  return ProjectRoots(roots)
+
+
+def load_collector() -> ModuleType:
+  omarchy = Path(os.environ.get("OMARCHY_PATH") or "/usr/share/omarchy")
+  path = omarchy / "bin" / "omarchy-agent-usage-claude"
+  loader = importlib.machinery.SourceFileLoader("omarchy_claude_collector", str(path))
+  spec = importlib.util.spec_from_loader(loader.name, loader)
+  if spec is None:
+    raise RuntimeError(f"Cannot load the installed Claude collector: {path}")
+  collector = importlib.util.module_from_spec(spec)
+  loader.exec_module(collector)
+  return collector
+
+
+def install_profile_scan(collector: ModuleType) -> None:
+  cached_scan = collector.cached_scan
+
+  def cached_profiles_scan(projects_path: Path, max_age_seconds: float):
+    return cached_scan(project_roots(projects_path), max_age_seconds)
+
+  collector.cached_scan = cached_profiles_scan
+
+
+def main() -> int:
+  collector = load_collector()
+  install_profile_scan(collector)
+  # Authentication, limits, fallbacks and other Anthropic clients stay upstream.
+  return collector.main()
+
+
+if __name__ == "__main__":
+  raise SystemExit(main())

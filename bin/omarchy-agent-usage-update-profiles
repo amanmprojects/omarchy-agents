@@ -1,0 +1,182 @@
+#!/usr/bin/python3 -I
+"""Refresh every agent record, with the fork's Claude profiles and OpenCode.
+
+Omarchy's own updater still collects the agents it owns. This wrapper runs it
+with the fork's agents excluded, collects those itself, and writes each record
+into the same usage directory. The widget watches that directory, so it never
+needs to know which updater produced a file.
+
+Usage:
+  omarchy-agent-usage-update-profiles [--force] [--limits-only]
+                                      [--except <agent>] [agent...]
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+# Agent id -> collector next to this script. The ids match the record `id` and
+# the widget's provider settings.
+CUSTOM_COLLECTORS = {
+  "claude": "omarchy-agent-usage-claude-profiles",
+  "opencode": "omarchy-agent-usage-opencode",
+}
+
+
+def omarchy_path() -> Path:
+  return Path(os.environ.get("OMARCHY_PATH") or "/usr/share/omarchy")
+
+
+def usage_dir() -> Path:
+  state = os.environ.get("XDG_STATE_HOME")
+  base = Path(state).expanduser() if state else Path.home() / ".local" / "state"
+  return base / "omarchy" / "agents" / "usage"
+
+
+def selected_agents(args: argparse.Namespace) -> list[str]:
+  excluded = set(args.excluded)
+  chosen = []
+  for agent in CUSTOM_COLLECTORS:
+    if agent in excluded:
+      continue
+    if args.agents and agent not in args.agents:
+      continue
+    chosen.append(agent)
+  return chosen
+
+
+def collector_flags(args: argparse.Namespace) -> list[str]:
+  flags = []
+  if args.force:
+    flags.append("--force")
+  if args.limits_only:
+    flags.append("--limits-only")
+  return flags
+
+
+def start_stock_updater(args: argparse.Namespace) -> subprocess.Popen[str] | None:
+  updater = omarchy_path() / "bin" / "omarchy-agent-usage-update"
+  if not updater.is_file():
+    print(f"omarchy-agent-usage-update-profiles: missing {updater}", file=sys.stderr)
+    return None
+
+  command = [str(updater), *collector_flags(args)]
+  for agent in CUSTOM_COLLECTORS:
+    command.extend(["--except", agent])
+  command.extend(args.agents)
+  return subprocess.Popen(command, text=True)
+
+
+def collect(agent: str, flags: list[str]) -> tuple[bool, str]:
+  script = Path(__file__).resolve().parent / CUSTOM_COLLECTORS[agent]
+  if not script.is_file():
+    return False, f"missing collector {script}"
+  result = subprocess.run([str(script), *flags], stdout=subprocess.PIPE, text=True)
+  if result.returncode != 0:
+    detail = result.stderr.strip() or f"exit {result.returncode}"
+    return False, f"{agent} collector failed: {detail}"
+
+  try:
+    record = json.loads(result.stdout)
+    if not isinstance(record, dict) or record.get("id") != agent:
+      raise ValueError("expected a usage record with matching id")
+  except (TypeError, ValueError) as exc:
+    return False, f"{agent} collector printed an invalid record: {exc}"
+  return True, result.stdout
+
+
+def write_record(agent: str, output: str) -> None:
+  directory = usage_dir()
+  directory.mkdir(parents=True, exist_ok=True)
+  fd, name = tempfile.mkstemp(dir=directory, prefix=f".{agent}.")
+  temporary = Path(name)
+  try:
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+      handle.write(output.rstrip() + "\n")
+    temporary.replace(directory / f"{agent}.json")
+  finally:
+    temporary.unlink(missing_ok=True)
+
+
+def autoswitch_claude(flags: list[str]) -> bool:
+  """Mirror the stock updater's account switch pass for the Claude collector."""
+  accounts = usage_dir().parent / "accounts" / "claude.json"
+  if not accounts.is_file():
+    return True
+  state = omarchy_path() / "bin" / "omarchy-agent-account-state"
+  if not state.is_file():
+    return True
+
+  result = subprocess.run([str(state), "autoswitch", "claude"], stdout=subprocess.PIPE, text=True)
+  if result.returncode != 0 or not result.stdout.strip():
+    return result.returncode == 0
+
+  ok, output = collect("claude", ["--limits-only"])
+  if not ok:
+    print(f"omarchy-agent-usage-update-profiles: {output}", file=sys.stderr)
+    return False
+  write_record("claude", output)
+  return True
+
+
+def main() -> int:
+  parser = argparse.ArgumentParser(description=__doc__)
+  parser.add_argument("--force", action="store_true")
+  parser.add_argument("--limits-only", action="store_true")
+  parser.add_argument("--except", dest="excluded", action="append", default=[])
+  parser.add_argument("agents", nargs="*")
+  args = parser.parse_intermixed_args()
+
+  stock = start_stock_updater(args)
+  agents = selected_agents(args)
+  flags = collector_flags(args)
+
+  status = 0 if stock is not None else 1
+  jobs = []
+  for agent in agents:
+    script = Path(__file__).resolve().parent / CUSTOM_COLLECTORS[agent]
+    try:
+      jobs.append((agent, subprocess.Popen(
+        [str(script), *flags],
+        stdout=subprocess.PIPE,
+        text=True,
+        stderr=subprocess.PIPE,
+      )))
+    except OSError as exc:
+      print(f"omarchy-agent-usage-update-profiles: cannot run {script}: {exc}", file=sys.stderr)
+      status = 1
+
+  for agent, process in jobs:
+    stdout, stderr = process.communicate()
+    if process.returncode != 0:
+      detail = (stderr or "").strip() or f"exit {process.returncode}"
+      print(f"omarchy-agent-usage-update-profiles: {agent} collector failed: {detail}", file=sys.stderr)
+      status = 1
+      continue
+    try:
+      record = json.loads(stdout)
+      if not isinstance(record, dict) or record.get("id") != agent:
+        raise ValueError("expected a usage record with matching id")
+    except (TypeError, ValueError) as exc:
+      print(f"omarchy-agent-usage-update-profiles: {agent} collector printed an invalid record: {exc}", file=sys.stderr)
+      status = 1
+      continue
+    write_record(agent, stdout)
+
+  if stock is not None and stock.wait() != 0:
+    status = 1
+
+  if "claude" in agents and not autoswitch_claude(flags):
+    status = 1
+
+  return status
+
+
+if __name__ == "__main__":
+  raise SystemExit(main())

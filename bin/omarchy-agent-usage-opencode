@@ -1,0 +1,340 @@
+#!/usr/bin/python3 -I
+"""Print OpenCode's local token usage as an Omarchy agent usage record.
+
+OpenCode keeps both its original JSON message store and a newer SQLite
+database. Current releases migrated to SQLite, but a machine can hold rows
+from both eras (the migration copies some messages and leaves others behind),
+so this collector reads every message table it understands and deduplicates
+by message id before adding anything up.
+
+No network calls and no credentials: this is local usage only. OpenCode Zen
+subscription limits would be a separate, account-scoped probe.
+"""
+
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import json
+import os
+import sqlite3
+import sys
+import urllib.parse
+from pathlib import Path
+from typing import Any, Iterable
+
+AGENT_ID = "opencode"
+AGENT_NAME = "OpenCode"
+SCHEMA_VERSION = 1
+
+
+def data_home() -> Path:
+  override = os.environ.get("OPENCODE_DATA_HOME") or os.environ.get("OPENCODE_DATA_DIR")
+  if override:
+    return Path(override).expanduser()
+  xdg = os.environ.get("XDG_DATA_HOME")
+  base = Path(xdg).expanduser() if xdg else Path.home() / ".local" / "share"
+  return base / "opencode"
+
+
+def database_path() -> Path:
+  override = os.environ.get("OPENCODE_DB")
+  return Path(override).expanduser() if override else data_home() / "opencode.db"
+
+
+def as_int(value: Any) -> int:
+  try:
+    return max(0, int(value))
+  except (TypeError, ValueError):
+    return 0
+
+
+def usage_from_message(data: dict[str, Any]) -> tuple[int, int, int, int, int, float]:
+  """Return input, output (including reasoning), cache read/write, total, cost."""
+  tokens = data.get("tokens")
+  if not isinstance(tokens, dict):
+    tokens = {}
+  cache = tokens.get("cache")
+  if not isinstance(cache, dict):
+    cache = {}
+
+  input_tokens = as_int(tokens.get("input"))
+  output_tokens = as_int(tokens.get("output")) + as_int(tokens.get("reasoning"))
+  cache_read = as_int(cache.get("read"))
+  cache_write = as_int(cache.get("write"))
+  total = input_tokens + output_tokens + cache_read + cache_write
+
+  # A provider can report only a total. Keep that usage instead of dropping
+  # the message; there is no split to show, but the day is not silent.
+  if total == 0:
+    total = as_int(tokens.get("total"))
+    if total > 0:
+      input_tokens = total
+
+  try:
+    cost = max(0.0, float(data.get("cost") or 0))
+  except (TypeError, ValueError):
+    cost = 0.0
+  return input_tokens, output_tokens, cache_read, cache_write, total, cost
+
+
+def model_from_message(data: dict[str, Any]) -> tuple[str, str]:
+  model = data.get("model")
+  if isinstance(model, dict):
+    provider = model.get("providerID")
+    model_id = model.get("id")
+  else:
+    provider = data.get("providerID")
+    model_id = data.get("modelID")
+  provider = str(provider or "unknown")
+  model_id = str(model_id or "unknown")
+  return provider, model_id
+
+
+def read_messages(path: Path) -> Iterable[tuple[str, str, int, str, dict[str, Any]]]:
+  """Yield (id, session_id, time_created, role, data) from every message table.
+
+  The old store is `message`; newer releases add `session_message` and keep
+  `message` as a migration remnant. Reading both and deduplicating by id is
+  what keeps a migrated session from being counted twice.
+  """
+  uri = "file:" + urllib.parse.quote(str(path)) + "?mode=ro"
+  connection = sqlite3.connect(uri, uri=True, timeout=2)
+  try:
+    connection.execute("PRAGMA query_only = ON")
+    tables = {
+      row[0]
+      for row in connection.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
+    }
+
+    if "message" in tables:
+      for message_id, session_id, created, raw in connection.execute(
+        "SELECT id, session_id, time_created, data FROM message ORDER BY time_created"
+      ):
+        parsed = parse_message(raw)
+        if parsed is None:
+          continue
+        yield str(message_id), str(session_id), as_int(created), str(parsed.get("role") or ""), parsed
+
+    if "session_message" in tables:
+      for message_id, session_id, created, role, raw in connection.execute(
+        "SELECT id, session_id, time_created, type, data FROM session_message ORDER BY time_created"
+      ):
+        if role not in ("user", "assistant"):
+          continue
+        parsed = parse_message(raw)
+        if parsed is None:
+          continue
+        # `type` is authoritative in the new table; the payload of a user
+        # message is plain text and has no role field at all.
+        parsed.setdefault("role", role)
+        yield str(message_id), str(session_id), as_int(created), str(parsed.get("role") or role), parsed
+  finally:
+    connection.close()
+
+
+def parse_message(raw: Any) -> dict[str, Any] | None:
+  try:
+    value = json.loads(str(raw))
+  except (TypeError, ValueError):
+    return None
+  return value if isinstance(value, dict) else None
+
+
+def local_date(timestamp_ms: int) -> dt.date | None:
+  try:
+    return dt.datetime.fromtimestamp(timestamp_ms / 1000).date()
+  except (OverflowError, OSError, ValueError):
+    return None
+
+
+def empty_bucket() -> dict[str, int | float]:
+  return {
+    "inputTokens": 0,
+    "outputTokens": 0,
+    "cacheReadInputTokens": 0,
+    "cacheCreationInputTokens": 0,
+    "costUsd": 0.0,
+  }
+
+
+def add_to_bucket(bucket: dict[str, Any], values: tuple[int, int, int, int, int, float]) -> None:
+  input_tokens, output_tokens, cache_read, cache_write, _, cost = values
+  bucket["inputTokens"] = as_int(bucket.get("inputTokens")) + input_tokens
+  bucket["outputTokens"] = as_int(bucket.get("outputTokens")) + output_tokens
+  bucket["cacheReadInputTokens"] = as_int(bucket.get("cacheReadInputTokens")) + cache_read
+  bucket["cacheCreationInputTokens"] = as_int(bucket.get("cacheCreationInputTokens")) + cache_write
+  bucket["costUsd"] = round(float(bucket.get("costUsd") or 0) + cost, 8)
+
+
+def recent_dates(today: dt.date, days: int = 7) -> list[str]:
+  return [(today - dt.timedelta(days=offset)).isoformat() for offset in range(days - 1, -1, -1)]
+
+
+def collect(path: Path, today: dt.date | None = None) -> dict[str, Any]:
+  if not path.is_file():
+    return empty_record(path)
+
+  today = today or dt.date.today()
+  recent = recent_dates(today)
+  recent_tokens = {day: 0 for day in recent}
+
+  # One message can exist in both stores. Prefer the copy with usage; a
+  # migration remnant with no tokens must not win over the live row.
+  messages: dict[str, tuple[str, str, int, str, dict[str, Any], int]] = {}
+  for message_id, session_id, created, role, data in read_messages(path):
+    _, _, _, _, total, _ = usage_from_message(data)
+    held = messages.get(message_id)
+    if held is None or total > held[5]:
+      messages[message_id] = (message_id, session_id, created, role, data, total)
+
+  sessions: set[str] = set()
+  today_sessions: set[str] = set()
+  active_days: set[str] = set()
+  model_usage: dict[str, dict[str, Any]] = {}
+  provider_usage: dict[str, dict[str, Any]] = {}
+  today_tokens_by_model: dict[str, int] = {}
+  total_prompts = 0
+  today_prompts = 0
+  today_tokens = 0
+  total_cost = 0.0
+
+  for _, session_id, created, role, data, _ in messages.values():
+    day = local_date(created)
+    if day is None:
+      continue
+
+    sessions.add(session_id)
+    active_days.add(day.isoformat())
+    if day == today:
+      today_sessions.add(session_id)
+
+    if role == "user":
+      total_prompts += 1
+      if day == today:
+        today_prompts += 1
+      continue
+
+    if role != "assistant":
+      continue
+
+    values = usage_from_message(data)
+    input_tokens, output_tokens, cache_read, cache_write, total, cost = values
+    provider, model_id = model_from_message(data)
+
+    add_to_bucket(model_usage.setdefault(model_id, empty_bucket()), values)
+    provider_bucket = provider_usage.setdefault(provider, empty_bucket())
+    add_to_bucket(provider_bucket, values)
+    provider_bucket["messages"] = as_int(provider_bucket.get("messages")) + 1
+
+    total_cost += cost
+
+    if day.isoformat() in recent_tokens:
+      recent_tokens[day.isoformat()] += total
+    if day == today:
+      today_tokens += total
+      today_tokens_by_model[model_id] = today_tokens_by_model.get(model_id, 0) + total
+
+  total_tokens = sum(
+    as_int(bucket.get("inputTokens"))
+    + as_int(bucket.get("outputTokens"))
+    + as_int(bucket.get("cacheReadInputTokens"))
+    + as_int(bucket.get("cacheCreationInputTokens"))
+    for bucket in model_usage.values()
+  )
+
+  return {
+    "schemaVersion": SCHEMA_VERSION,
+    "id": AGENT_ID,
+    "name": AGENT_NAME,
+    "updatedAt": dt.datetime.now(dt.timezone.utc).isoformat(),
+    "ready": bool(sessions and (total_prompts > 0 or total_tokens > 0)),
+    "hasLocalStats": True,
+    "hasPromptStats": True,
+    "tierLabel": "",
+    "usageStatusText": "",
+    "authHelpText": "",
+    "limits": [],
+    "todayPrompts": today_prompts,
+    "todaySessions": len(today_sessions),
+    "todayTotalTokens": today_tokens,
+    "todayTokensByModel": today_tokens_by_model,
+    "recentDays": [
+      {"date": day, "messageCount": recent_tokens[day]} for day in recent
+    ],
+    "totalPrompts": total_prompts,
+    "totalSessions": len(sessions),
+    "activeDays": len(active_days),
+    "activeDates": sorted(active_days),
+    "totalTokens": total_tokens,
+    "costUsd": round(total_cost, 8),
+    "modelUsage": model_usage,
+    "providerUsage": provider_usage,
+  }
+
+
+def empty_record(path: Path) -> dict[str, Any]:
+  today = dt.date.today()
+  return {
+    "schemaVersion": SCHEMA_VERSION,
+    "id": AGENT_ID,
+    "name": AGENT_NAME,
+    "updatedAt": dt.datetime.now(dt.timezone.utc).isoformat(),
+    "ready": False,
+    "hasLocalStats": True,
+    "hasPromptStats": True,
+    "tierLabel": "",
+    "usageStatusText": f"No OpenCode database at {path}",
+    "authHelpText": "",
+    "limits": [],
+    "todayPrompts": 0,
+    "todaySessions": 0,
+    "todayTotalTokens": 0,
+    "todayTokensByModel": {},
+    "recentDays": [{"date": day, "messageCount": 0} for day in recent_dates(today)],
+    "totalPrompts": 0,
+    "totalSessions": 0,
+    "activeDays": 0,
+    "activeDates": [],
+    "totalTokens": 0,
+    "costUsd": 0.0,
+    "modelUsage": {},
+    "providerUsage": {},
+  }
+
+
+def previous_record() -> dict[str, Any] | None:
+  usage_dir = Path(os.environ.get("XDG_STATE_HOME") or Path.home() / ".local" / "state") / "omarchy" / "agents" / "usage"
+  try:
+    record = json.loads((usage_dir / f"{AGENT_ID}.json").read_text(encoding="utf-8"))
+  except (OSError, ValueError):
+    return None
+  return record if isinstance(record, dict) and record.get("id") == AGENT_ID else None
+
+
+def main() -> int:
+  parser = argparse.ArgumentParser(description=__doc__)
+  parser.add_argument("--force", action="store_true", help="accepted for parity with other collectors")
+  parser.add_argument("--limits-only", action="store_true", help="reuse the last record; there are no limits to probe")
+  args = parser.parse_args()
+
+  if args.limits_only:
+    record = previous_record()
+    if record is None:
+      record = empty_record(database_path())
+    print(json.dumps(record, separators=(",", ":"), sort_keys=True))
+    return 0
+
+  path = database_path()
+  try:
+    record = collect(path)
+  except (OSError, sqlite3.Error) as exc:
+    print(f"omarchy-agent-usage-opencode: cannot read {path}: {exc}", file=sys.stderr)
+    return 1
+
+  print(json.dumps(record, separators=(",", ":"), sort_keys=True))
+  return 0
+
+
+if __name__ == "__main__":
+  raise SystemExit(main())
